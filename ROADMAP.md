@@ -1,119 +1,325 @@
-# Multi-region lab: roadmap de estudo
+# Multi-region lab
 
-Laboratório local para estudar multi-região **ativo-ativo**, failover, perda total de região e failback.
-Cada região tem as mesmas peças (serviço Go + Postgres + Redpanda/Kafka). O HAProxy faz o papel de Route53 / Global Accelerator.
+Laboratório local para estudar multi-região ativo-ativo, failover, perda total de região e failback.
+Cada região tem: serviço Go (hexagonal) + Postgres + Redpanda (Kafka API). O HAProxy simula Route53 / Global Accelerator.
 
 ```
-                    k6 (carga + verifier)          Grafana (A | B)  <-  Prometheus
-                           │
-                    ┌──────▼───────┐
-                    │   HAProxy    │  :8080 ativo-ativo   :8090 failover (A primária, B backup)
-                    └───┬──────┬───┘
-         ┌──────────────┘      └──────────────┐
-  ┌──────▼────────── região A ─┐        ┌─────▼────────── região B ─┐
-  │ service-a (hexagonal)      │        │ service-b (hexagonal)     │
-  │ postgres-a                 │        │ postgres-b                │
-  │ redpanda-a  [a.customers]  │◄──WAN──┤ redpanda-b  [b.customers] │
-  └────────────────────────────┘──WAN──►└───────────────────────────┘
-        cada serviço consome o tópico da OUTRA região e aplica no seu banco (papel do MM2 / MSK Replicator)
+              k6 (writers · readers · verifier)     Grafana ◄── Prometheus
+                             │
+                      ┌──────▼───────┐
+                      │   HAProxy    │  :8080 ativo-ativo   :8090 failover
+                      └───┬──────┬───┘
+           ┌──────────────┘      └──────────────┐
+    ┌──────▼──── região A ────┐          ┌──────▼──── região B ────┐
+    │ service-a               │          │ service-b               │
+    │ postgres-a              │          │ postgres-b              │
+    │ redpanda-a [a.customers]│◄── WAN ──│ redpanda-b [b.customers]│
+    └─────────────────────────┘── WAN ──►└─────────────────────────┘
 ```
 
-## Como rodar
+---
+
+## Início rápido
 
 ```bash
-make tidy     # uma vez, resolve go.mod/go.sum (precisa de rede)
-make up       # sobe as duas regiões, router, Prometheus e Grafana
-make load     # em outro terminal: carga contínua do k6
-open http://localhost:3000   # dashboard "Multi-Region · Customers"
-make test     # testes unitários do núcleo (sem Docker)
+make tidy      # uma vez — resolve go.mod/go.sum
+make up        # sobe tudo
+make load      # terminal separado — carga contínua k6
+make test      # testes unitários (sem Docker)
 ```
 
-Portas: router 8080 (ativo-ativo) e 8090 (failover), stats do HAProxy 8404, região A direta 18081, região B direta 18082, Prometheus 9090, Grafana 3000.
-Cenários de falha: `chaos/chaos.sh <ação> <a|b>` (rode sem argumentos para ver a lista).
+| URL | O que é |
+|---|---|
+| http://localhost:3000 | Grafana — dashboard "Multi-Region · Customers" |
+| http://localhost:8080 | Router ativo-ativo |
+| http://localhost:8090 | Router failover (A primária, B backup) |
+| http://localhost:8404/stats | HAProxy stats + drain/maint manual |
+| http://localhost:9090 | Prometheus |
+| http://localhost:18081 | Região A direta (bypass router) |
+| http://localhost:18082 | Região B direta (bypass router) |
 
-## Como o serviço funciona
+Cenários de falha: `chaos/chaos.sh` sem argumentos lista todos os comandos.
 
-- **CRUD** de `customer` (`name`, `address`, `email`, `nickname`) com `id` UUID. O header `Idempotency-Key` vira o `id` e torna o POST idempotente.
-- **Status no banco** (`PENDING` → `PUBLISHED` ou `PUBLISH_FAILED`). A linha é o outbox: grava no banco, tenta publicar no tópico **da própria região** e atualiza o status. Se o Kafka estiver fora, a escrita continua funcionando e o *relay* (a cada 2s) republica o que não está `PUBLISHED`.
-- **Replicação entre regiões** por eventos: cada serviço consome `<outra região>.customers` e aplica com *last-write-wins* (`version` = timestamp em µs, desempate pela região). É idempotente, então duplicata e reentrega não fazem mal. Linhas replicadas entram como `PUBLISHED`, o que evita loop de replicação.
-- **`/health`** devolve 503 quando o **banco** está fora. Com `HEALTH_REQUIRE_KAFKA=true` o Kafka local também derruba a região. É isso que o router usa para decidir.
-- **Hexagonal**: `domain` (regras) → `ports` (contratos) → `application` (casos de uso) → `adapters/in` (HTTP, replicator Kafka) e `adapters/out` (Postgres, publisher Kafka, métricas). O núcleo é testado só com fakes.
+---
 
-## Sua dúvida: banco da região A fora, grava na B mas publica no Kafka da A?
+## Arquitetura do serviço
 
-**Não. A região que fez o commit é a que publica.** O motivo:
+- **CRUD** de `customer` com `id` UUID. `Idempotency-Key` no header vira o `id` → POST idempotente.
+- **Outbox por status**: grava no banco (`PENDING`), publica no tópico da própria região, atualiza para `PUBLISHED` ou `PUBLISH_FAILED`. Se o Kafka cair, o relay (a cada 2 s) republica o backlog.
+- **Replicação cross-region**: cada serviço consome o tópico da outra região e aplica com last-write-wins (`version` = timestamp µs, desempate pelo nome da região). Idempotente — duplicata não causa problema.
+- **Health check**: `/health` retorna 503 quando o banco está fora. Com `HEALTH_REQUIRE_KAFKA=true` o Kafka local também derruba a região. O HAProxy usa isso para rotear.
 
-1. Se o serviço A gravasse no banco de B e publicasse no Kafka de A, o dado e o evento viveriam em regiões diferentes. Se a A cair depois, o evento fica preso no Kafka dela e o banco de B tem uma linha cujo evento ninguém publicou.
-2. O `origin_region` e o consumidor de B passariam a depender de um evento que volta para B, que já tem a linha.
-3. O outbox só garante atomicidade quando banco e status estão no mesmo lugar.
-
-O que fazer em vez disso, em ordem de recomendação:
-
-- **Padrão (já implementado):** banco da A fora → `/health` da A dá 503 → o router manda a requisição **inteira** para B. B grava no banco B e publica no Kafka B. A unidade de failover é a região.
-- **Degradação parcial (fase 5, para experimentar):** se você quiser que A continue "viva" com o banco fora, o serviço A **encaminha a requisição por HTTP** para o serviço B (nunca fala direto com o banco B). B faz banco + Kafka B, com `origin_region=b`. Mesmo resultado, só que a decisão fica no serviço e não no router.
-- **Kafka fora com banco de pé:** não troca de região. Grava local, status `PUBLISH_FAILED`, o relay republica quando o Kafka voltar. Veja o painel "customers by publish status".
+---
 
 ## Fases
 
-Marque cada item quando conseguir explicar o que viu no dashboard.
-
-### Fase 0 · Fundação (pronta)
-- [x] Compose com duas regiões, redes `region-a`, `region-b`, `wan`, `edge`
-- [x] Serviço Go hexagonal, outbox por status, replicação cross-region
-- [x] HAProxy ativo-ativo (:8080) e failover (:8090)
-- [x] k6 (writers, readers, verifier) e dashboard Grafana por região
-
 ### Fase 1 · Ativo-ativo em regime normal
-- [ ] `make up && make load`. As duas regiões recebem ~metade do tráfego cada
-- [ ] Observe "Replication visibility p95" (quanto tempo uma escrita da A leva para aparecer na B)
-- [ ] Escreva o mesmo `id` nas duas regiões quase ao mesmo tempo (`curl` direto em 18081 e 18082) e veja quem vence (LWW) e o status das linhas
-- Pergunta: o relógio é confiável para LWW? O que muda com clock skew entre regiões reais?
+
+```
+clients ──► HAProxy :8080
+                ├──► service-a ──► postgres-a ──► redpanda-a ──► service-b (consome)
+                └──► service-b ──► postgres-b ──► redpanda-b ──► service-a (consome)
+```
+
+**Objetivo:** entender a replicação assíncrona por eventos e o comportamento LWW.
+
+```bash
+make up && make load
+# Grafana → "Replication visibility p95" — tempo até escrita de A aparecer em B
+# Teste de conflito LWW:
+curl -X POST http://localhost:18081/customers -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: same-id' -d '{"name":"A","address":"x","email":"a@a","nickname":"a"}'
+curl -X POST http://localhost:18082/customers -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: same-id' -d '{"name":"B","address":"x","email":"b@b","nickname":"b"}'
+# Quem venceu? Veja o campo `name` depois de alguns segundos em ambas as regiões.
+```
+
+---
 
 ### Fase 2 · Falha de componente
-| Cenário | Comando | O que esperar | Pergunta |
-|---|---|---|---|
-| Kafka local fora | `chaos.sh kafka-down a` | Escritas em A seguem OK; `PUBLISH_FAILED` sobe; B deixa de receber os eventos de A | Qual é o RPO de A para B agora? |
-| Kafka volta | `chaos.sh kafka-up a` | O relay drena o backlog; lag de replicação sobe e depois cai | Por que a ordem por cliente se mantém? (chave = id) |
-| Banco fora | `chaos.sh db-down a` | `/health` 503, router tira A em ~2-3s, falhas no k6 só nessa janela | Quanto dura a janela e o que a controla (`inter`, `fall`)? |
-| Banco volta | `chaos.sh db-up a` | A volta para o router após `rise`; relay e consumidor retomam | O consumidor perdeu algo enquanto o banco estava fora? |
-| `HEALTH_REQUIRE_KAFKA=true` | recriar serviços com a variável | Kafka fora agora derruba a região inteira | Qual dos dois comportamentos é melhor para pagamentos? |
+
+```
+╔══ Kafka fora ══════════════════════════╗
+║ service-a ──► postgres-a              ║
+║      │                                ║
+║      ▼ (PUBLISH_FAILED)               ║
+║  relay drena quando Kafka volta        ║
+╚════════════════════════════════════════╝
+
+╔══ Banco fora ══════════════════════════╗
+║ service-a ──► /health 503             ║
+║ HAProxy remove A em ~2 s              ║
+║ Todo tráfego vai para B               ║
+╚════════════════════════════════════════╝
+```
+
+| Cenário | Comando | O que observar no Grafana |
+|---|---|---|
+| Kafka fora | `chaos.sh kafka-down a` | `PUBLISH_FAILED` sobe em A; B para de receber eventos de A |
+| Kafka volta | `chaos.sh kafka-up a` | Relay drena backlog; lag de replicação pica e cai |
+| Banco fora | `chaos.sh db-down a` | `dependency_up{db}` vai a 0; HAProxy tira A; erros no k6 só na janela de detecção |
+| Banco volta | `chaos.sh db-up a` | A retorna ao pool após `rise` checks; relay e consumidor retomam |
+
+---
 
 ### Fase 3 · Perda total de região e failback
-- [ ] `chaos.sh region-down a`: tudo vai para B. Meça o RTO (janela de erros no k6) e o RPO (escritas de A que não chegaram em B: veja `replication timeouts`)
-- [ ] `chaos.sh region-up a` (failback com dados preservados): A volta, consome o que B escreveu enquanto ela estava fora. Observe o lag baixar até zero
-- [ ] Compare as portas 8080 (ativo-ativo) e 8090 (A primária, B backup: o failback é automático)
-- [ ] Failback controlado: no `http://localhost:8404/stats` coloque A em `DRAIN`, valide, depois `READY`
-- Pergunta: faz sentido failback automático em produção? O que você validaria antes de devolver tráfego?
 
-### Fase 4 · Partição de rede (split brain) e perda com dados
-- [ ] `chaos.sh partition a`: A e B continuam vivas e aceitando escrita, mas não se falam. Os dois lados divergem
-- [ ] `chaos.sh heal a`: veja a convergência por LWW, o lag e quantas escritas foram sobrescritas (`skipped_stale`)
-- [ ] `chaos.sh region-wipe a` → `region-up a`: A volta **vazia**. O consumidor de A só recebe eventos novos de B, porque o offset do grupo vive no cluster de B
-- [ ] `chaos.sh backfill a` (cópia do banco de B) e/ou `chaos.sh reset-offsets a` (replay do tópico de B)
-- Pergunta: por que o replay do tópico não reconstrói as linhas que **A originou**? (o histórico de A estava no Kafka de A, que foi destruído) O que resolveria? (snapshot, replicação lógica, retenção infinita)
+```
+╔══ Região A cai ══════════════════════╗       ╔══ Failback ══════════════════════════╗
+║ HAProxy detecta (fall 2, ~2 s)       ║  ──►  ║ chaos.sh region-up a                ║
+║ 100% do tráfego vai para B           ║       ║ A consome eventos de B (lag baixa)  ║
+║ RPO = eventos ainda no Kafka de A    ║       ║ HAProxy reinsere A (rise 2)          ║
+╚══════════════════════════════════════╝       ╚══════════════════════════════════════╝
+```
 
-### Fase 5 · Experimentos avançados
-- [ ] **Postgres primary/replica de verdade**: streaming replication A → B, `pg_ctl promote`, `pg_rewind` no failback (ativo-passivo clássico, equivalente a Aurora Global)
-- [ ] **Patroni + etcd** para failover automático do banco dentro da região
-- [ ] **Degradação parcial**: serviço A encaminha para B por HTTP quando o banco local está fora (ver a dúvida acima)
-- [ ] **Latência WAN** com Toxiproxy ou `tc netem` entre os serviços e o Kafka remoto, para ver o lag crescer sem partição
-- [ ] **CockroachDB** com `--locality=region=a|b` no lugar de Postgres + eventos, e comparar com a abordagem manual
-- [ ] **MirrorMaker 2** real no lugar do consumidor (prefixo de tópico, tradução de offsets no failover)
-- [ ] **Chaos aleatório**: script que derruba e levanta componentes em loop enquanto o verifier checa a consistência final
+```bash
+chaos.sh region-down a    # derruba service-a + postgres-a + redpanda-a
+# Grafana: erros k6 → janela de RTO; "replication timeouts" → RPO estimado
+
+chaos.sh region-up a      # failback com dados preservados
+# Grafana: lag de replicação baixa até zero conforme A consome o backlog de B
+```
+
+Failback controlado: em `http://localhost:8404/stats` coloque A em `DRAIN` (valide) e depois `READY`.
+
+---
+
+### Fase 4 · Partição de rede e perda de dados
+
+```
+╔══ Partição ══════════════════════════════════════════╗
+║  região A ◄──── WAN cortada ────► região B          ║
+║  Ambas aceitam escrita — dados divergem              ║
+║                                                      ║
+║  chaos.sh heal a → LWW reconcilia (skipped_stale)   ║
+╚══════════════════════════════════════════════════════╝
+
+╔══ Disaster (wipe + backfill) ════════════════════════╗
+║  region-wipe a  →  A volta vazia                     ║
+║  backfill a     →  cópia do banco de B para A        ║
+║  reset-offsets a → replay do tópico de B             ║
+╚══════════════════════════════════════════════════════╝
+```
+
+```bash
+chaos.sh partition a      # corta WAN de A
+# Escreva nas duas regiões; observe divergência no banco
+
+chaos.sh heal a           # reconecta WAN
+# Grafana: skipped_stale mostra quantas escritas foram descartadas pelo LWW
+
+chaos.sh region-wipe a    # destrói A e seus volumes
+chaos.sh region-up a
+chaos.sh backfill a       # cópia do banco de B
+chaos.sh reset-offsets a  # replay do tópico de B (dados originados em A não voltam)
+```
+
+---
+
+### Fase 5 · Postgres streaming replication (ativo-passivo)
+
+Arquitetura desta fase: **um único primário (postgres-a)**. postgres-b é réplica física que recebe WAL de A. Sem conflitos, sem LWW — só um lado escreve. Equivalente a Aurora Global Database.
+
+```
+              WAL stream (física)
+postgres-a ──────────────────────────────► postgres-b (standby, read-only)
+     │         pg_stat_replication              │
+     │◄────────────────────────────────────────┘
+     │
+postgres-exporter-a ──► Prometheus ──► Grafana
+                         (lag bytes · lag seconds · role · timeline)
+
+service-a ──┐
+            ├──► host=postgres-a,postgres-b  target_session_attrs=read-write
+service-b ──┘         (pgx roteia para o primário automaticamente)
+```
+
+#### 5.1 · Replicação async — medir o RPO
+
+```
+escrita  ──►  postgres-a  ──WAL──►  postgres-b
+                                    └── replay_lag_bytes / replay_lag_seconds
+                                        (Grafana → Phase 5 → WAL replay lag)
+```
+
+```bash
+make load
+make pg-status   # pg_stat_replication ao vivo
+```
+
+RPO em bytes/segundos = o que seria perdido se postgres-a caísse agora.
+
+---
+
+#### 5.2 · Failover — derruba A, promova B
+
+```
+postgres-a  DOWN
+                        pg_promote()
+postgres-b ────────────────────────► postgres-b  PRIMARY  (timeline 2)
+                                           │
+                              pgx reconecta automaticamente
+                         service-a e service-b passam a escrever em B
+```
+
+```bash
+chaos.sh region-down a    # derruba service-a + postgres-a + redpanda-a
+chaos.sh pg-failover b    # pg_promote() em postgres-b
+# Grafana: postgres-b role → PRIMARY; timeline-b sobe para 2
+```
+
+---
+
+#### 5.3 · Failback com pg_rewind
+
+```
+postgres-a  (divergida, timeline 1)
+      │
+      │   pg_rewind --source=postgres-b
+      ▼
+postgres-a  (rewound, sem divergência)  ──standby──►  postgres-b (primary)
+```
+
+```bash
+chaos.sh region-up a      # sobe postgres-a (ainda divergida)
+chaos.sh pg-rewind a      # desfaz divergência, A vira réplica de B
+# Alternativa (mais lenta, reconstrói do zero):
+chaos.sh pg-basebackup a
+```
+
+---
+
+#### 5.4 · Switchover controlado — devolve liderança para A
+
+```
+postgres-b  PRIMARY (timeline 2)
+      │
+      ├── chaos.sh pg-rewind a    →  postgres-a vira réplica de B
+      ├── chaos.sh pg-switchover a →  postgres-a promovida  (timeline 3)
+      └── chaos.sh pg-rewind b    →  postgres-b vira réplica de A
+
+resultado: postgres-a PRIMARY (timeline 3)  ·  postgres-b standby
+           sem perda de dados
+```
+
+```bash
+chaos.sh region-up a
+chaos.sh pg-rewind a
+chaos.sh pg-switchover a
+chaos.sh pg-rewind b
+```
+
+---
+
+#### 5.5 · Split brain — sem fencing
+
+```
+postgres-a  PRIMARY (timeline 1)  ◄── aceita escrita ──┐
+                                                        │ dados divergem
+postgres-b  PRIMARY (timeline 2)  ◄── aceita escrita ──┘
+
+fix: chaos.sh pg-rewind a   OU   chaos.sh pg-basebackup a
+```
+
+```bash
+chaos.sh pg-split-brain   # promove B com A ainda viva
+# Grafana: dois primários com timelines diferentes
+```
+
+Sem fencing (STONITH, lease, epoch), o nó que "volta" pode sobrescrever dados do novo primário.
+
+---
+
+#### 5.6 · Sync replication — RPO = 0
+
+```
+                     commit só confirma quando B aplicou o WAL
+client ──► postgres-a ──remote_apply──► postgres-b
+                │                            │
+                └── latência p95 de A sobe   │
+                    A trava se B cair ───────┘
+```
+
+```bash
+chaos.sh pg-sync-on     # synchronous_commit = remote_apply
+# Grafana: WAL lag → 0; latência p95 de A sobe
+
+chaos.sh db-down b      # postgres-b cai → escritas em A travam
+chaos.sh db-up b
+chaos.sh pg-sync-off    # volta para async
+```
+
+---
+
+#### Comparativo Fases 1–4 vs Fase 5
+
+| | Fases 1–4 | Fase 5 |
+|---|---|---|
+| Replicação | Kafka events + LWW | WAL streaming (física) |
+| Conflitos | LWW resolve | Impossíveis (1 primário) |
+| RPO async | lag do Kafka | bytes de WAL não replicados |
+| RPO sync | — | 0 (`remote_apply`) |
+| Failover | automático via HAProxy | manual (`pg_promote`) |
+| Failback | automático (outbox relay) | `pg_rewind` ou `pg_basebackup` |
+| Equivalente AWS | MSK Replicator + DynamoDB GT | Aurora Global Database |
+
+---
 
 ## Mapa para a AWS
 
-| Aqui | Na AWS |
+| Lab | AWS |
 |---|---|
-| HAProxy + health checks | Route53 (failover / latency routing) ou Global Accelerator |
-| Postgres por região + eventos | Aurora Global Database, DynamoDB Global Tables, ou RDS + replicação própria |
-| Redpanda + consumidor cross-region | MSK + MSK Replicator, ou SNS/SQS cross-region |
-| `chaos.sh region-down` | AWS FIS / simulação de região indisponível |
-| Outbox por status | Outbox + Lambda/Stream, ou transactional outbox no DynamoDB |
+| HAProxy + health checks | Route53 (failover/latency routing) ou Global Accelerator |
+| Postgres + eventos (fases 1–4) | DynamoDB Global Tables ou RDS + replicação própria |
+| Postgres streaming replication (fase 5) | Aurora Global Database |
+| Redpanda + consumidor cross-region | MSK + MSK Replicator |
+| `chaos.sh region-down` | AWS FIS |
+| Outbox por status | Transactional outbox + Lambda/Streams |
 
-## Notas e limites do laboratório
+---
 
-- A "WAN" é só uma rede Docker: sem latência nem perda de pacote até a Fase 5.
-- O relógio é o mesmo para as duas regiões (mesma máquina), então o LWW aqui é mais benigno que na vida real.
-- Com várias réplicas do serviço na mesma região o relay publicaria em duplicata (sem `SKIP LOCKED`). Isso é seguro porque o consumidor é idempotente, mas vale como exercício.
-- `go.sum` vem do `make tidy` rodado na sua máquina. Se atualizar dependências, ajuste a versão do Go na imagem do `Dockerfile` para acompanhar o `go` do `go.mod`.
+## Limites do laboratório
+
+- A rede `wan` é Docker puro: sem latência nem perda de pacotes. Use Toxiproxy ou `tc netem` para simular WAN real.
+- O relógio é o mesmo para as duas regiões (mesma máquina) — o LWW aqui é mais benigno que em produção com clock skew.
+- O relay sem `SKIP LOCKED` publicaria em duplicata com múltiplas réplicas do serviço. Seguro (consumidor idempotente), mas não ideal.
