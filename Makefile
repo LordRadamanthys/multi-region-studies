@@ -1,4 +1,4 @@
-.PHONY: up down clean logs ps load test tidy status urls
+.PHONY: up down clean logs ps load test tidy status urls pg-status
 
 up:            ## build and start both regions + router + Prometheus + Grafana
 	docker compose up -d --build
@@ -18,6 +18,9 @@ ps status:
 
 load:          ## continuous k6 load (WRITE_RATE, READ_RATE, VERIFY_RATE, DURATION are overridable)
 	docker compose --profile load run --rm k6
+
+pg-status:    ## show postgres replication lag, role, and timeline (Phase 5)
+	@./chaos/chaos.sh pg-lag
 
 test:
 	go test -race ./...

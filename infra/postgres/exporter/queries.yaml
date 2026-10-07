@@ -1,0 +1,57 @@
+# Custom queries for prometheuscommunity/postgres-exporter (Phase 5)
+# Exposes replication lag, instance role, and timeline ID for the dashboard.
+
+pg_replication_lag:
+  query: |
+    SELECT
+      COALESCE(EXTRACT(EPOCH FROM write_lag),  0)   AS write_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM flush_lag),  0)   AS flush_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM replay_lag), 0)   AS replay_lag_seconds,
+      COALESCE((sent_lsn - write_lsn)::float8,  0) AS write_lag_bytes,
+      COALESCE((sent_lsn - flush_lsn)::float8,  0) AS flush_lag_bytes,
+      COALESCE((sent_lsn - replay_lsn)::float8, 0) AS replay_lag_bytes,
+      state,
+      sync_state
+    FROM pg_stat_replication
+  master: true
+  metrics:
+    - write_lag_seconds:
+        usage: "GAUGE"
+        description: "Time between primary writing WAL and standby writing it (seconds)"
+    - flush_lag_seconds:
+        usage: "GAUGE"
+        description: "Time between primary writing WAL and standby flushing to disk (seconds)"
+    - replay_lag_seconds:
+        usage: "GAUGE"
+        description: "Time between primary writing WAL and standby replaying it = RPO (seconds)"
+    - write_lag_bytes:
+        usage: "GAUGE"
+        description: "Bytes sent but not yet written on standby"
+    - flush_lag_bytes:
+        usage: "GAUGE"
+        description: "Bytes sent but not yet flushed on standby"
+    - replay_lag_bytes:
+        usage: "GAUGE"
+        description: "Bytes sent but not yet replayed on standby = RPO in bytes"
+    - state:
+        usage: "LABEL"
+        description: "Replication state (startup/catchup/streaming/backup/stopping)"
+    - sync_state:
+        usage: "LABEL"
+        description: "Sync state: async | sync | remote_write | remote_apply"
+
+pg_recovery:
+  query: "SELECT CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END AS is_standby"
+  master: false
+  metrics:
+    - is_standby:
+        usage: "GAUGE"
+        description: "1 if this Postgres is a standby/replica, 0 if it is the primary"
+
+pg_timeline:
+  query: "SELECT timeline_id FROM pg_control_checkpoint()"
+  master: false
+  metrics:
+    - timeline_id:
+        usage: "GAUGE"
+        description: "Current WAL timeline ID; increments on every pg_promote / failover"

@@ -13,3 +13,11 @@ scrape_configs:
   - job_name: haproxy
     static_configs:
       - targets: ["haproxy:8404"]
+
+  # Phase 5: replication lag, role (primary/standby), timeline ID
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter-a:9187"]
+        labels: {pg_instance: "a"}
+      - targets: ["postgres-exporter-b:9187"]
+        labels: {pg_instance: "b"}

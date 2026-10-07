@@ -81,6 +81,87 @@ case "$action" in
     echo; echo "router view (be_active_active / be_failover):"
     curl -s 'http://localhost:8404/stats;csv' | awk -F, '$1 ~ /^be_/ && $2 ~ /^region/ {printf "  %-18s %-10s %s\n", $1, $2, $18}' ;;
 
+  # ---- Phase 5: Postgres streaming replication --------------------------------
+
+  pg-failover)  # promote postgres-<r> to primary (run after the current primary is down)
+    need_region
+    docker exec "mr-postgres-$r" psql -U app -d customers \
+      -c "SELECT pg_promote(wait := true);"
+    echo ">> postgres-$r is now PRIMARY on a new timeline." \
+         "Services will reconnect automatically (target_session_attrs=read-write)." ;;
+
+  pg-rewind)    # reattach old primary postgres-<r> as a replica after divergence
+    need_region
+    o="$(other "$r")"
+    dc stop "service-$r"
+    # pg_rewind undoes the diverged WAL and points postgres-r at the new primary
+    docker exec -u postgres -e PGPASSWORD=replicator "mr-postgres-$r" pg_rewind \
+      -D /var/lib/postgresql/data \
+      --source-server="host=postgres-$o port=5432 user=replicator password=replicator dbname=postgres" \
+      --progress
+    # Update primary_conninfo to stream from the new primary and signal standby mode
+    docker exec -u postgres "mr-postgres-$r" sh -c "
+      echo \"primary_conninfo = 'host=postgres-$o port=5432 user=replicator password=replicator'\" \
+           >> /var/lib/postgresql/data/postgresql.auto.conf
+      touch /var/lib/postgresql/data/standby.signal
+    "
+    dc start "postgres-$r"
+    wait_healthy "mr-postgres-$r"
+    dc start "service-$r"
+    echo ">> postgres-$r rewound and attached as replica to postgres-$o (new primary)." ;;
+
+  pg-basebackup)  # rebuild postgres-<r> from scratch from the other region (slower, safer than rewind)
+    need_region
+    o="$(other "$r")"
+    dc stop "service-$r" "postgres-$r"
+    docker run --rm \
+      --network "mr-wan" \
+      -v "mr-postgres-$r-data:/var/lib/postgresql/data" \
+      -e PGPASSWORD=replicator \
+      postgres:16-alpine \
+      sh -c "rm -rf /var/lib/postgresql/data/* && \
+             pg_basebackup -h postgres-$o -p 5432 -U replicator \
+               -D /var/lib/postgresql/data -Fp -Xs -R -P --checkpoint=fast"
+    dc start "postgres-$r"
+    wait_healthy "mr-postgres-$r"
+    dc start "service-$r"
+    echo ">> postgres-$r rebuilt from postgres-$o via pg_basebackup (new standby)." ;;
+
+  pg-switchover)  # controlled failback: make postgres-<r> primary again after pg-rewind
+    need_region
+    docker exec "mr-postgres-$r" psql -U app -d customers \
+      -c "SELECT pg_promote(wait := true);"
+    echo ">> postgres-$r promoted (switchover). Reattach the old primary as replica with pg-rewind <other>." ;;
+
+  pg-sync-on)   # RPO=0: writes on postgres-a block until postgres-b has applied the WAL
+    docker exec mr-postgres-a psql -U app -d customers \
+      -c "ALTER SYSTEM SET synchronous_standby_names = '*';" \
+      -c "ALTER SYSTEM SET synchronous_commit = 'remote_apply';" \
+      -c "SELECT pg_reload_conf();"
+    echo ">> synchronous_commit=remote_apply enabled." \
+         "RPO is now 0 but write latency rises and postgres-a BLOCKS if postgres-b is unreachable." ;;
+
+  pg-sync-off)  # revert to async: lower write latency, RPO > 0
+    docker exec mr-postgres-a psql -U app -d customers \
+      -c "ALTER SYSTEM SET synchronous_standby_names = '';" \
+      -c "ALTER SYSTEM SET synchronous_commit = 'on';" \
+      -c "SELECT pg_reload_conf();"
+    echo ">> Reverted to async replication. Write latency drops; RPO is no longer zero." ;;
+
+  pg-lag)       # show live replication lag from the primary's point of view
+    docker exec mr-postgres-a psql -U app -d customers -x \
+      -c "SELECT application_name, client_addr, state, sync_state,
+                 write_lag, flush_lag, replay_lag,
+                 (sent_lsn - replay_lsn) AS replay_lag_bytes
+          FROM pg_stat_replication;" ;;
+
+  pg-split-brain)  # DANGER: promote postgres-b while postgres-a is still running → both think they are primary
+    echo "WARNING: this will cause data divergence. Both primaries will accept writes." >&2
+    docker exec mr-postgres-b psql -U app -d customers \
+      -c "SELECT pg_promote(wait := false);" 2>/dev/null || true
+    echo ">> postgres-b promoted while postgres-a may still be running as primary."
+    echo ">> Writes diverge on both sides. Fix with: chaos.sh pg-rewind a  OR  pg-basebackup a." ;;
+
   *)
     cat <<'USAGE'
 actions:
@@ -93,6 +174,16 @@ actions:
   kafka-down|kafka-up <a|b>
   partition|heal      <a|b>   cut / restore the region's WAN link
   status               containers + what the router thinks of each region
+
+phase 5 – postgres streaming replication:
+  pg-failover    <a|b>  promote postgres-<r> to primary (after the other side is down)
+  pg-rewind      <a|b>  reattach old primary postgres-<r> as replica via pg_rewind
+  pg-basebackup  <a|b>  rebuild postgres-<r> from scratch from the other region
+  pg-switchover  <a|b>  controlled pg_promote (for a planned failback)
+  pg-sync-on           enable synchronous_commit=remote_apply (RPO=0, higher latency)
+  pg-sync-off          revert to async replication
+  pg-lag               show live WAL lag from pg_stat_replication on postgres-a
+  pg-split-brain       DANGER: promote B while A is still up (demonstrates divergence)
 USAGE
     ;;
 esac

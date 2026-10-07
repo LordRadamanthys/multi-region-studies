@@ -40,8 +40,24 @@ services:
     <<: *postgres
     container_name: mr-postgres-a
     hostname: postgres-a
-    volumes: [postgres-a-data:/var/lib/postgresql/data]
-    networks: [region-a]
+    # Phase 5: enable streaming replication toward postgres-b.
+    # hot_standby lets the replica serve read-only queries.
+    # synchronous_commit and synchronous_standby_names are left at defaults (async)
+    # and can be changed at runtime via chaos.sh pg-sync-on / pg-sync-off.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=128MB
+      - -c
+      - hot_standby=on
+    volumes:
+      - postgres-a-data:/var/lib/postgresql/data
+      - ./infra/postgres/primary/init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+    networks: [region-a, wan]
 
   redpanda-a:
     <<: *redpanda
@@ -77,7 +93,8 @@ services:
     environment:
       <<: *service-env
       REGION: a
-      DATABASE_URL: postgres://app:app@postgres-a:5432/customers?sslmode=disable
+      # Phase 5: multi-host DSN so pgx finds the read-write primary after a failover.
+      DATABASE_URL: postgres://app:app@postgres-a,postgres-b/customers?sslmode=disable&target_session_attrs=read-write
       KAFKA_BROKERS: redpanda-a:9092
       KAFKA_TOPIC: a.customers
       REMOTE_KAFKA_BROKERS: redpanda-b:9092
@@ -89,12 +106,21 @@ services:
     networks: [region-a, wan, edge]
 
   # ------------------------------ REGION B ------------------------------
+  # Phase 5: postgres-b is a physical streaming replica of postgres-a.
+  # The custom entrypoint runs pg_basebackup on first boot (empty volume) then
+  # starts normally. No separate init container → Docker Compose never re-triggers
+  # a dependency restart that could accidentally promote the standby.
   postgres-b:
     <<: *postgres
     container_name: mr-postgres-b
     hostname: postgres-b
-    volumes: [postgres-b-data:/var/lib/postgresql/data]
-    networks: [region-b]
+    entrypoint: ["/bin/sh", "/replica-setup/entrypoint.sh"]
+    volumes:
+      - postgres-b-data:/var/lib/postgresql/data
+      - ./infra/postgres/replica/entrypoint.sh:/replica-setup/entrypoint.sh:ro
+    depends_on:
+      postgres-a: {condition: service_healthy}
+    networks: [region-b, wan]
 
   redpanda-b:
     <<: *redpanda
@@ -129,13 +155,16 @@ services:
     environment:
       <<: *service-env
       REGION: b
-      DATABASE_URL: postgres://app:app@postgres-b:5432/customers?sslmode=disable
+      # Phase 5: writes go to postgres-a (primary); pgx reconnects to postgres-b if it is promoted.
+      DATABASE_URL: postgres://app:app@postgres-a,postgres-b/customers?sslmode=disable&target_session_attrs=read-write
       KAFKA_BROKERS: redpanda-b:9092
       KAFKA_TOPIC: b.customers
-      REMOTE_KAFKA_BROKERS: redpanda-a:9092
-      REMOTE_KAFKA_TOPIC: a.customers
+      # Phase 5: REMOTE_KAFKA_BROKERS intentionally omitted.
+      # Postgres streaming replication replaces the Kafka-based LWW replication path for B.
+      # service-a still consumes b.customers (events are skipped as stale – harmless).
     ports: ["18082:8080"]
     depends_on:
+      postgres-a: {condition: service_healthy}    # service-b writes go to postgres-a
       postgres-b: {condition: service_healthy}
       redpanda-init-b: {condition: service_completed_successfully}
     networks: [region-b, wan, edge]
@@ -176,6 +205,32 @@ services:
     ports: ["3000:3000"]
     depends_on: [prometheus]
     networks: [edge]
+
+  # Phase 5: postgres_exporter instances expose pg_stat_replication, pg_is_in_recovery,
+  # and timeline_id so Grafana can show WAL lag, role (PRIMARY/STANDBY), and failover events.
+  postgres-exporter-a:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: mr-postgres-exporter-a
+    environment:
+      DATA_SOURCE_NAME: "postgresql://exporter:exporter@postgres-a:5432/postgres?sslmode=disable"
+    command: ["--extend.query-path=/etc/pg-exporter/queries.yaml"]
+    volumes:
+      - ./infra/postgres/exporter/queries.yaml:/etc/pg-exporter/queries.yaml:ro
+    depends_on:
+      postgres-a: {condition: service_healthy}
+    networks: [region-a, edge]
+
+  postgres-exporter-b:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: mr-postgres-exporter-b
+    environment:
+      DATA_SOURCE_NAME: "postgresql://exporter:exporter@postgres-b:5432/postgres?sslmode=disable"
+    command: ["--extend.query-path=/etc/pg-exporter/queries.yaml"]
+    volumes:
+      - ./infra/postgres/exporter/queries.yaml:/etc/pg-exporter/queries.yaml:ro
+    depends_on:
+      postgres-b: {condition: service_healthy}
+    networks: [region-b, edge]
 
   k6:                            # docker compose --profile load run --rm k6
     image: grafana/k6:0.55.0

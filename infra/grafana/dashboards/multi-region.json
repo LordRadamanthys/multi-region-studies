@@ -2106,6 +2106,304 @@
           "sort": "desc"
         }
       }
+    },
+
+    {
+      "type": "row",
+      "title": "Phase 5 \u00b7 Postgres Streaming Replication (primary A \u2192 physical standby B)",
+      "id": 30,
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 46, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "postgres-a role",
+      "id": 31,
+      "description": "PRIMARY (0) = accepts writes. STANDBY (1) = replica. Changes on failover / switchover.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 47, "w": 6, "h": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_recovery_is_standby{pg_instance=\"a\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {"text": "PRIMARY", "color": "green", "index": 0},
+                "1": {"text": "STANDBY", "color": "blue",  "index": 1}
+              }
+            }
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}, {"color": "green", "value": 0}]},
+          "noValue": "?",
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "postgres-b role",
+      "id": 32,
+      "description": "STANDBY (1) normally. Becomes PRIMARY (0) after pg_promote / failover.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 6, "y": 47, "w": 6, "h": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_recovery_is_standby{pg_instance=\"b\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {"text": "PRIMARY", "color": "green", "index": 0},
+                "1": {"text": "STANDBY", "color": "blue",  "index": 1}
+              }
+            }
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "blue", "value": 1}]},
+          "noValue": "?",
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "postgres-a timeline",
+      "id": 33,
+      "description": "WAL timeline ID. Increments each time this instance is promoted (failover or switchover).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 12, "y": 47, "w": 6, "h": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_timeline_timeline_id{pg_instance=\"a\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+          "noValue": "?",
+          "color": {"mode": "thresholds"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "none", "graphMode": "none", "textMode": "value", "justifyMode": "center"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "postgres-b timeline",
+      "id": 34,
+      "description": "Jumps above postgres-a timeline after postgres-b is promoted. Shows the two instances diverged.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 18, "y": 47, "w": 6, "h": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_timeline_timeline_id{pg_instance=\"b\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+          "noValue": "?",
+          "color": {"mode": "thresholds"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "none", "graphMode": "none", "textMode": "value", "justifyMode": "center"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL replay lag \u2013 bytes not yet replayed on postgres-b (RPO in bytes)",
+      "id": 35,
+      "description": "How many bytes of committed WAL postgres-b has not yet applied. Zero with sync replication (pg-sync-on). Grows during pg-partition or pg-kafka-down. This is your data-loss window.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 51, "w": 12, "h": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_replay_lag_bytes{pg_instance=\"a\"}",
+          "legendFormat": "replay lag bytes",
+          "refId": "A",
+          "interval": "5s"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_write_lag_bytes{pg_instance=\"a\"}",
+          "legendFormat": "write lag bytes",
+          "refId": "B",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12,
+            "showPoints": "never", "spanNulls": false,
+            "stacking": {"mode": "none", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL replay lag \u2013 seconds (RPO in time)",
+      "id": 36,
+      "description": "Time elapsed between postgres-a writing WAL and postgres-b replaying it. With synchronous_commit=remote_apply (chaos.sh pg-sync-on) this drops to 0 and write latency rises instead.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 12, "y": 51, "w": 12, "h": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_replay_lag_seconds{pg_instance=\"a\"}",
+          "legendFormat": "replay lag (s)",
+          "refId": "A",
+          "interval": "5s"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_write_lag_seconds{pg_instance=\"a\"}",
+          "legendFormat": "write lag (s)",
+          "refId": "B",
+          "interval": "5s"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_flush_lag_seconds{pg_instance=\"a\"}",
+          "legendFormat": "flush lag (s)",
+          "refId": "C",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12,
+            "showPoints": "never", "spanNulls": false,
+            "stacking": {"mode": "none", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Write latency p95 \u2013 region A (observe the spike when pg-sync-on is active)",
+      "id": 37,
+      "description": "With async replication this is the normal app latency. After chaos.sh pg-sync-on the primary waits for postgres-b to apply each WAL record, so p95 rises. If postgres-b goes down while sync is on, writes on A block entirely.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 59, "w": 12, "h": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(http_request_duration_seconds_bucket{region=\"a\",route!~\".*/(metrics|health|live)\"}[30s])))",
+          "legendFormat": "p95 write latency (A)",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12,
+            "showPoints": "never", "spanNulls": false,
+            "stacking": {"mode": "none", "group": "A"}
+          },
+          "color": {"mode": "fixed", "fixedColor": "#4e79a7"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Sync state (async \u2192 sync with pg-sync-on)",
+      "id": 38,
+      "description": "async = default, RPO > 0. remote_apply = pg-sync-on active, RPO = 0 but writes block if standby is unreachable.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 12, "y": 59, "w": 12, "h": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "pg_replication_lag_replay_lag_seconds{pg_instance=\"a\"}",
+          "legendFormat": "{{sync_state}}",
+          "refId": "A",
+          "interval": "5s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+          "color": {"mode": "thresholds"},
+          "unit": "s",
+          "noValue": "no replica connected"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^sync_state$/", "values": false},
+        "colorMode": "none", "graphMode": "none", "textMode": "value", "justifyMode": "center"
+      }
     }
   ]
 }
