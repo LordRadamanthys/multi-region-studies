@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: customer-service
+    static_configs:
+      - targets: ["service-a:8080"]
+        labels: {region: a}
+      - targets: ["service-b:8080"]
+        labels: {region: b}
+
+  - job_name: haproxy
+    static_configs:
+      - targets: ["haproxy:8404"]

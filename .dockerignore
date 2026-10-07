@@ -1,0 +1,7 @@
+.idea
+.git
+_to_delete
+k6
+chaos
+infra
+*.md
